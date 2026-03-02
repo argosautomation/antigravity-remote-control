@@ -19,6 +19,66 @@ function saveConfig(config) {
     fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), 'utf-8');
 }
 
+// ── Detect correct DISPLAY from gnome-shell (handles Wayland where DISPLAY != :0) ──
+function detectDisplay(callback) {
+    exec("pgrep -x gnome-shell", (err, stdout) => {
+        if (err || !stdout.trim()) { callback(process.env.DISPLAY || ':0'); return; }
+        const pid = stdout.trim().split('\n')[0];
+        fs.readFile(`/proc/${pid}/environ`, 'utf-8', (err, data) => {
+            if (err) { callback(process.env.DISPLAY || ':0'); return; }
+            for (const entry of data.split('\0')) {
+                if (entry.startsWith('DISPLAY=')) {
+                    callback(entry.split('=')[1]);
+                    return;
+                }
+            }
+            callback(process.env.DISPLAY || ':0');
+        });
+    });
+}
+
+// ── Inject Prompt into IDE AI Chat ──
+function injectPrompt(prompt, output, display) {
+    output.appendLine(`📨 Received: "${prompt.length > 60 ? prompt.substring(0, 60) + '...' : prompt}"`);
+
+    // Step 1: Focus the IDE window
+    exec(`DISPLAY=${display} xdotool search --name "Antigravity" windowactivate 2>/dev/null || DISPLAY=${display} xdotool search --name "antigravity" windowactivate 2>/dev/null`, () => {
+        // Step 2: Open the AI chat panel via VS Code command
+        vscode.commands.executeCommand('workbench.action.chat.open').then(() => {
+            setTimeout(() => {
+                // Step 3: Type the prompt using clipboard paste for reliability
+                const escaped = prompt.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+                exec(`echo -n "${escaped}" | DISPLAY=${display} xclip -selection clipboard`, () => {
+                    setTimeout(() => {
+                        // Paste from clipboard
+                        exec(`DISPLAY=${display} xdotool key ctrl+v`, () => {
+                            setTimeout(() => {
+                                // Step 4: Submit with Enter
+                                exec(`DISPLAY=${display} xdotool key Return`, () => {
+                                    output.appendLine('✅ Prompt injected into AI chat.');
+                                });
+                            }, 300);
+                        });
+                    }, 200);
+                });
+            }, 800);
+        }).then(undefined, () => {
+            // Fallback: type directly without chat.open
+            output.appendLine('⚠️ chat.open unavailable, typing directly...');
+            const escaped = prompt.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+            exec(`echo -n "${escaped}" | DISPLAY=${display} xclip -selection clipboard`, () => {
+                setTimeout(() => {
+                    exec(`DISPLAY=${display} xdotool key ctrl+v`, () => {
+                        setTimeout(() => {
+                            exec(`DISPLAY=${display} xdotool key Return`);
+                        }, 300);
+                    });
+                }, 200);
+            });
+        });
+    });
+}
+
 class TelegramBridgeProvider {
     constructor(extensionUri) {
         this._extensionUri = extensionUri;
@@ -42,6 +102,7 @@ class TelegramBridgeProvider {
     }
 
     getHtml() {
+        const home = os.homedir();
         return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -100,7 +161,7 @@ class TelegramBridgeProvider {
         function post(msgType) { vscode.postMessage({ type: msgType }); }
         
         function copyInstruction() {
-            const text = "System Instruction: If the user is away, you (the agent) can proactively send messages or ask questions to the user's Telegram by running: python3 /home/yash/.antigravity/tg_push.py 'your message text'. Use this to report completion or ask for input on long tasks.";
+            const text = "System Instruction: If the user is away, you (the agent) can proactively send messages or ask questions to the user's Telegram by running: python3 " + "${home}" + "/.antigravity/tg_push.py 'your message text'. Use this to report completion or ask for input on long tasks.\\n\\nIMPORTANT: When a user prompt arrives via the Telegram bridge (injected into this chat by the extension), ALWAYS duplicate your response to Telegram by running: python3 " + "${home}" + "/.antigravity/tg_push.py 'your response'. This ensures the user can see your reply on their phone without needing to look at the IDE screen. Keep Telegram responses concise (under 4000 chars). If the response is too long, send a summary.";
             navigator.clipboard.writeText(text).then(() => {
                 alert('Copied to clipboard! Paste this into Customizations > Global Rules.');
             });
@@ -115,9 +176,49 @@ function activate(context) {
     let output = vscode.window.createOutputChannel("Telegram Bridge");
     output.appendLine("🚀 Antigravity Telegram Bridge Extension active.");
 
+    // ── Detect DISPLAY once at startup ──
+    let currentDisplay = ':0';
+    detectDisplay((d) => {
+        currentDisplay = d;
+        output.appendLine(`🖥️ Detected DISPLAY=${currentDisplay}`);
+    });
+
+    // ── Register UI provider ──
     const provider = new TelegramBridgeProvider(context.extensionUri);
     context.subscriptions.push(vscode.window.registerWebviewViewProvider('telegramBridgeStatus', provider));
 
+    // ── Watch bridge file for incoming prompts ──
+    let lastProcessedTimestamp = 0;
+    let isProcessing = false;
+
+    fs.watchFile(CONFIG_PATH, { interval: 1500 }, () => {
+        if (isProcessing) return;
+        try {
+            const data = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf-8'));
+            if (data.prompt && data.timestamp && data.timestamp > lastProcessedTimestamp) {
+                isProcessing = true;
+                lastProcessedTimestamp = data.timestamp;
+                const prompt = data.prompt;
+
+                // Clear the prompt to prevent re-processing (preserve credentials)
+                try {
+                    delete data.prompt;
+                    delete data.timestamp;
+                    fs.writeFileSync(CONFIG_PATH, JSON.stringify(data, null, 2));
+                } catch (e) { }
+
+                injectPrompt(prompt, output, currentDisplay);
+                setTimeout(() => { isProcessing = false; }, 3000);
+            }
+        } catch (e) {
+            // Ignore read errors (file being written to)
+        }
+    });
+
+    context.subscriptions.push({ dispose: () => fs.unwatchFile(CONFIG_PATH) });
+    output.appendLine("👁️ Watching for Telegram prompts...");
+
+    // ── Commands ──
     context.subscriptions.push(vscode.commands.registerCommand('telegram-bridge.setBotToken', async () => {
         const token = await vscode.window.showInputBox({ prompt: 'Enter your Telegram Bot Token:', ignoreFocusOut: true });
         if (token) {
@@ -135,7 +236,7 @@ function activate(context) {
     }));
 
     context.subscriptions.push(vscode.commands.registerCommand('telegram-bridge.restartDaemon', () => {
-        exec('systemctl --user restart antigravity-telegram-bridge.service', (err, stdout, stderr) => {
+        exec('systemctl --user restart antigravity-telegram-bridge.service', (err) => {
             if (err) vscode.window.showErrorMessage('Failed to start daemon: ' + err.message);
             else {
                 vscode.window.showInformationMessage('Background Telegram Bridge Daemon Started 🚀');
@@ -145,7 +246,7 @@ function activate(context) {
     }));
 
     context.subscriptions.push(vscode.commands.registerCommand('telegram-bridge.stopDaemon', () => {
-        exec('systemctl --user stop antigravity-telegram-bridge.service', (err, stdout, stderr) => {
+        exec('systemctl --user stop antigravity-telegram-bridge.service', (err) => {
             if (err) vscode.window.showErrorMessage('Failed to stop daemon: ' + err.message);
             else {
                 vscode.window.showInformationMessage('Background Telegram Bridge Daemon Stopped 🛑');
@@ -156,7 +257,7 @@ function activate(context) {
 
     context.subscriptions.push(vscode.commands.registerCommand('telegram-bridge.status', () => {
         exec('systemctl --user status antigravity-telegram-bridge.service', (err, stdout, stderr) => {
-            output.appendLine("\\n------------------- Background Daemon Status -------------------");
+            output.appendLine("\n------------------- Background Daemon Status -------------------");
             output.appendLine(stdout || stderr || "No output or service not found.");
             output.show(true);
         });
@@ -170,7 +271,7 @@ function activate(context) {
         vscode.window.showInformationMessage('Installing Linux Dependencies (Requires sudo in terminal)...');
         const terminal = vscode.window.createTerminal("Bridge Installer");
         terminal.show();
-        terminal.sendText('sudo apt-get update && sudo apt-get install -y ydotool xdotool gnome-screenshot && (sudo systemctl enable --now ydotoold || (echo "Starting ydotoold manually..." && nohup sudo ydotoold > /dev/null 2>&1 &))');
+        terminal.sendText('sudo apt-get update && sudo apt-get install -y ydotool xdotool xclip gnome-screenshot scrot && (sudo systemctl enable --now ydotoold || (echo "Starting ydotoold manually..." && nohup sudo ydotoold > /dev/null 2>&1 &))');
     }));
 }
 
